@@ -1,0 +1,13 @@
+[tool.poetry]
+name = "docsid"
+version = "0.0.0"
+description = "A repository for document management"
+authors = ["Colk-tech <master@colk.dev>"]
+readme = "README.md"
+
+[tool.poetry.dependencies]
+python = "^3.12"
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
