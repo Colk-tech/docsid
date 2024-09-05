@@ -1,100 +1,72 @@
-# Customized from: https://github.com/orgs/python-poetry/discussions/1879#discussioncomment-216865
+# Copied from https://github.com/astral-sh/rye/discussions/239#discussioncomment-6033855
+# Thanks!
 
-FROM python:3.12-slim as python-base
+FROM python:3.12-slim AS rye
 
-    # python
-ENV PYTHONUNBUFFERED=1 \
-    # prevents python creating .pyc files
-    PYTHONDONTWRITEBYTECODE=1 \
-    \
-    # pip
-    PIP_NO_CACHE_DIR=off \
-    PIP_DISABLE_PIP_VERSION_CHECK=on \
-    PIP_DEFAULT_TIMEOUT=100 \
-    \
-    # poetry
-    # https://python-poetry.org/docs/configuration/#using-environment-variables
-    # make poetry install to this location
-    POETRY_HOME="/opt/poetry" \
-    # make poetry create the virtual environment in the project's root
-    # it gets named `.venv`
-    POETRY_VIRTUALENVS_IN_PROJECT=true \
-    # do not ask any interactive question
-    POETRY_NO_INTERACTION=1 \
-    \
-    # paths
-    # this is where our requirements + virtual environment will live
-    PYSETUP_PATH="/opt/pysetup" \
-    VENV_PATH="/opt/pysetup/.venv"
+# Prevents Python from writing pyc files.
+ENV PYTHONDONTWRITEBYTECODE=1
 
+# Keeps Python from buffering stdout and stderr to avoid situations where
+# the application crashes without emitting any logs due to buffering.
+ENV PYTHONUNBUFFERED=1
 
-# prepend poetry and venv to path
-ENV PATH="$POETRY_HOME/bin:$VENV_PATH/bin:$PATH"
+ENV PYTHONPATH="/workspace/src:$PYTHONPATH"
 
+# The virtual environment is created in the working directory where rye is run
+# so the development and production environments must be in the same directory respectively.
+WORKDIR /workspace
 
-# `builder-base` stage is used to build deps + create our virtual environment
-FROM python-base as builder-base
-RUN apt-get update \
-    && apt-get install --no-install-recommends -y \
-        # deps for installing poetry
-        curl \
-        # deps for building python deps
-        build-essential \
-        # psycopg2 dependencies
-        libpq-dev \
-        # Required for migrations
-        postgresql-client
+RUN \
+  --mount=type=cache,target=/var/lib/apt/lists \
+  --mount=type=cache,target=/var/cache/apt/archives \
+  apt-get update \
+  && apt-get install -y --no-install-recommends build-essential
 
-# install poetry - respects $POETRY_VERSION & $POETRY_HOME
-RUN curl -sSL https://install.python-poetry.org | python3 -
+ENV RYE_HOME="/opt/rye"
+ENV PATH="$RYE_HOME/shims:$PATH"
 
-# copy project requirement files here to ensure they will be cached.
-WORKDIR $PYSETUP_PATH
-COPY poetry.lock pyproject.toml ./
+# RYE_INSTALL_OPTION is required to build.
+# See: https://github.com/mitsuhiko/rye/issues/246
+RUN curl -sSf https://rye-up.com/get | RYE_NO_AUTO_INSTALL=1 RYE_INSTALL_OPTION="--yes" bash
 
-# install runtime deps - uses $POETRY_VIRTUALENVS_IN_PROJECT internally
-RUN poetry install
+# Download dependencies as a separate step to take advantage of Docker's caching.
+# Leverage a bind mount to some files to avoid having to copy them into
+# into this layer.
+RUN --mount=type=bind,source=pyproject.toml,target=pyproject.toml \
+    --mount=type=bind,source=requirements.lock,target=requirements.lock \
+    --mount=type=bind,source=requirements-dev.lock,target=requirements-dev.lock \
+    --mount=type=bind,source=.python-version,target=.python-version \
+    --mount=type=bind,source=README.md,target=README.md \
+    rye sync --no-dev --no-lock
 
+RUN . .venv/bin/activate
 
-# `development` image is used during development / testing
-FROM python-base as development
+# Stage for development.
+# The development environment assumes a devcontainer and the environment is
+# closed inside the container, so you don't need to be aware of the virtual environment
+FROM rye AS dev
 
-ENV LC_ALL=en_US.UTF-8 \
-    TZ=JST-9 \
-    TERM=xtermdocker-attachingdocker-attaching
+RUN --mount=type=bind,source=pyproject.toml,target=pyproject.toml \
+    --mount=type=bind,source=requirements.lock,target=requirements.lock \
+    --mount=type=bind,source=requirements-dev.lock,target=requirements-dev.lock \
+    --mount=type=bind,source=.python-version,target=.python-version \
+    --mount=type=bind,source=README.md,target=README.md \
+    rye sync --no-lock
 
-WORKDIR $PYSETUP_PATH
+# Stage for production
+FROM rye AS run
 
-# copy in our built poetry + venv
-COPY --from=builder-base $POETRY_HOME $POETRY_HOME
-COPY --from=builder-base $PYSETUP_PATH $PYSETUP_PATH
+# Create a non-privileged user that the app will run under.
+# See https://docs.docker.com/develop/develop-images/dockerfile_best-practices/#user
+ARG UID=10001
+RUN adduser \
+    --disabled-password \
+    --gecos "" \
+    --home "/nonexistent" \
+    --shell "/sbin/nologin" \
+    --no-create-home \
+    --uid "${UID}" \
+    appuser
 
-# install runtime deps - uses $POETRY_VIRTUALENVS_IN_PROJECT internally
-RUN apt-get update \
-    && apt-get install --no-install-recommends -y \
-        # Required for migrations
-        postgresql-client
-
-# will become mountpoint of our code
-ENV PYTHONPATH="$PYTHONPATH:/deploy"
-WORKDIR /deploy
-
-
-# `production` image used for runtime
-FROM python-base as production
-
-ENV LC_ALL=en_US.UTF-8 \
-    TZ=JST-9 \
-    TERM=xtermdocker-attachingdocker-attaching
-
-COPY --from=builder-base $PYSETUP_PATH $PYSETUP_PATH
-
-# install runtime deps - uses $POETRY_VIRTUALENVS_IN_PROJECT internally
-RUN apt-get update \
-    && apt-get install --no-install-recommends -y \
-        # Required for migrations
-        postgresql-client
-
-# will become mountpoint of our code
-ENV PYTHONPATH="$PYTHONPATH:/deploy"
-WORKDIR /deploy
+# Switch to the non-privileged user to run the application.
+USER appuser
